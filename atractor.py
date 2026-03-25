@@ -84,7 +84,6 @@ def ingest_file(content_bytes: bytes, filename: str):
                 tmp.write(content_bytes)
                 tmp_path = tmp.name
             raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
-            raw.filter(l_freq=0.5, h_freq=None, verbose=False)
             fs = raw.info["sfreq"]
             channels = {ch: raw.get_data(picks=[ch])[0] for ch in raw.ch_names[:32]}
             os.unlink(tmp_path)
@@ -496,12 +495,12 @@ sidebar = html.Div([
     # Header
     html.Div([
         html.Div("⬡", style={"fontSize": "24px", "color": ACCENT, "marginBottom": "4px"}),
-        html.Div("TAKENS ENGINE", style={
+        html.Div("3D signal Analysis", style={
             "fontFamily": "'JetBrains Mono', monospace",
             "fontSize": "13px", "fontWeight": "600",
             "color": ACCENT, "letterSpacing": "0.12em",
         }),
-        html.Div("v2.0 · Topological EEG Analysis", style={
+        html.Div("Topological EEG Analysis _ Rosh Guadiana & Lorudes García", style={
             "fontFamily": "'JetBrains Mono', monospace",
             "fontSize": "10px", "color": "#566573", "marginTop": "2px",
         }),
@@ -776,8 +775,7 @@ def on_upload(contents, filename):
 )
 def run_analysis(n_clicks, ch_data, fs, channel, epoch, dim, max_tau_ms):
     empty_fig = go.Figure().update_layout(**_layout_base(), height=300,
-                                          paper_bgcolor=TRANSPARENT,
-                                          plot_bgcolor=TRANSPARENT)
+                                          )
 
     def fail(msg):
         status_style = {
@@ -789,7 +787,6 @@ def run_analysis(n_clicks, ch_data, fs, channel, epoch, dim, max_tau_ms):
 
     if not ch_data or not channel or channel not in ch_data:
         return fail("No data loaded.  Upload a file and select a channel.")
-
     try:
         x_full = np.array(ch_data[channel], dtype=np.float64)
         fs     = float(fs)
@@ -797,38 +794,54 @@ def run_analysis(n_clicks, ch_data, fs, channel, epoch, dim, max_tau_ms):
         t0, t1   = float(epoch[0]), float(epoch[1])
         i0, i1   = int(t0 * fs), min(int(t1 * fs), len(x_full))
         x        = x_full[i0:i1]
-        t        = np.linspace(t0, t1, len(x))
 
+        # 1. Linear Filtering (Stationarity enforcement)
+        x = sp_signal.detrend(x)
+        x = bandpass(x, fs, 0.5, min(45.0, fs/2.0 - 1))
+        
         if len(x) < 50:
-            return fail("Epoch too short (< 50 samples).  Expand the time window.")
+            return fail("Epoch too short (< 50 samples). Expand the time window.")
 
-        # ── Tau ─────────────────────────────────────────────────────────────
+        # 2. Anti-Aliasing & Decimation (Complexity Reduction)
+        f_target = 100.0  
+        q_factor = max(1, int(fs / f_target))
+
+        if q_factor > 1:
+            x_dec = sp_signal.decimate(x, q_factor, ftype='iir', zero_phase=True)
+            fs_new = fs / q_factor
+        else:
+            x_dec = x
+            fs_new = fs
+
+        # 3. Memory Alignment
+        x_dec = np.ascontiguousarray(x_dec, dtype=np.float32)
+        t_dec = np.linspace(t0, t1, len(x_dec))
+
+        # 4. Topological Lag Calculation (on Decimated Signal)
         max_tau_sec = max_tau_ms / 1000.0
-        tau = compute_optimal_tau(x, fs, max_lag_sec=max_tau_sec)
-        tau = max(1, tau)
+        tau_dec = compute_optimal_tau(x_dec, fs_new, max_lag_sec=max_tau_sec)
+        tau_dec = max(1, tau_dec)
 
-        # ── Phase Space ──────────────────────────────────────────────────────
-        E = phase_space(x, tau, dim=min(int(dim), 3))  # render always 3D
+        # 5. Phase Space Construction
+        # Utilize your existing function but pass the aligned, float32, decimated data
+        dim = min(int(dim), 3)
+        E = phase_space(x_dec, tau_dec, dim=dim) 
 
-        # ── Spectral Energy for color ────────────────────────────────────────
+        # 6. Feature Extraction (Spectra, Quality, Energy)
         M      = E.shape[0]
-        energy = spectral_energy_gradient(x, fs, M)
+        energy = spectral_energy_gradient(x_dec, fs_new, M)
+        powers, freqs, psd = compute_band_powers(x_dec, fs_new)
+        quality = signal_quality(x_dec, fs_new)
 
-        # ── PSD + Band Powers ───────────────────────────────────────────────
-        powers, freqs, psd = compute_band_powers(x, fs)
-
-        # ── Signal Quality ──────────────────────────────────────────────────
-        quality = signal_quality(x, fs)
-
-        # ── Figures ─────────────────────────────────────────────────────────
-        f_ts    = fig_timeseries(t, x, energy, channel, tau)
-        f_3d    = fig_phase_space(E, energy, tau)
+        # 7. Figures Generation
+        f_ts    = fig_timeseries(t_dec, x_dec, energy, channel, tau_dec)
+        f_3d    = fig_phase_space(E, energy, tau_dec)
         f_psd   = fig_psd(freqs, psd)
         f_bands = fig_band_radar(powers)
 
-        # ── Top metrics ─────────────────────────────────────────────────────
-        rms = float(np.sqrt(np.mean(x ** 2)))
-        snr = float(10 * np.log10(np.var(x) / (np.var(np.diff(x)) + 1e-12)))
+        # 8. Top metrics (Calculated on decimated for speed, SNR remains invariant)
+        rms = float(np.sqrt(np.mean(x_dec ** 2)))
+        snr = float(10 * np.log10(np.var(x_dec) / (np.var(np.diff(x_dec)) + 1e-12)))
 
         # ── Insight panels ───────────────────────────────────────────────────
         def insight_row(label, value):
@@ -871,16 +884,11 @@ def run_analysis(n_clicks, ch_data, fs, channel, epoch, dim, max_tau_ms):
         theta_pct = powers.get("θ Theta", 0)
 
         state_hints = []
-        if alpha_pct > 30:
-            state_hints.append("↑ Alpha  →  relaxed / eyes-closed")
-        if delta_pct > 40:
-            state_hints.append("↑ Delta  →  deep sleep / pathology")
-        if theta_pct > 25:
-            state_hints.append("↑ Theta  →  drowsiness / memory encoding")
-        if kurtosis > 10:
-            state_hints.append("High kurtosis  →  possible spike artifacts")
-        if not state_hints:
-            state_hints = ["Normal waking spectrum pattern"]
+        if alpha_pct > 30: state_hints.append("↑ Alpha  →  relaxed / eyes-closed")
+        if delta_pct > 40: state_hints.append("↑ Delta  →  deep sleep / pathology")
+        if theta_pct > 25: state_hints.append("↑ Theta  →  drowsiness / memory encoding")
+        if kurtosis > 10:  state_hints.append("High kurtosis  →  possible spike artifacts")
+        if not state_hints: state_hints = ["Normal waking spectrum pattern"]
 
         dynamics_panel = html.Div([
             insight_row("Hurst Exponent", f"{hurst_val:.3f}"),
@@ -907,16 +915,17 @@ def run_analysis(n_clicks, ch_data, fs, channel, epoch, dim, max_tau_ms):
         }
         status_msg = (
             f"✓  Analysis complete  ·  {channel}  ·  "
-            f"{len(x)} samples  ·  τ={tau} smp ({tau/fs*1000:.1f}ms)  ·  "
+            f"{len(x_dec)} samples (Decimated {fs:.0f}Hz→{fs_new:.0f}Hz)  ·  "
+            f"τ={tau_dec} smp ({tau_dec/fs_new*1000:.1f}ms)  ·  "
             f"Manifold shape: {E.shape}"
         )
 
         return (
             f_ts, f_3d, f_psd, f_bands,
-            f"{fs:.0f} Hz",
+            f"{fs_new:.0f} Hz",
             f"{(t1-t0):.1f}s",
-            f"{tau} smp",
-            f"{len(x):,}",
+            f"{tau_dec} smp",
+            f"{len(x_dec):,}",
             f"{rms:.2f}",
             f"{snr:.1f}",
             quality_panel,
@@ -942,4 +951,5 @@ if __name__ == "__main__":
     print(" Open  →  http://127.0.0.1:8050")
     print(" Formats: EDF, BDF, CSV, TXT, FIF, SET, NPY")
     print("=" * 60)
-    app.run(debug=False, port=8050)
+    # Terminate correctly specifying the server parameters
+    app.run(debug=False, port=8050, dev_tools_silence_routes_logging=True)
