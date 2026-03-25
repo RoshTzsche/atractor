@@ -3,7 +3,7 @@
 ![Takens' Attractor Dashboard](assets/screenshot.png)
 
 ## Overview
-This repository contains the source code for the **Takens' Attractor Dashboard v2.0**, an interactive high-performance computational tool designed for the topological reconstruction and nonlinear dynamic analysis of univariate clinical time-series data (EEG, ECG, EMG). 
+This repository contains the source code for the **Takens' Attractor Dashboard**, an interactive high-performance computational tool designed for the topological reconstruction and nonlinear dynamic analysis of univariate clinical time-series data (EEG, ECG, EMG). 
 
 The system leverages advanced digital signal processing (DSP) and differential topology to map scalar physiological recordings into multi-dimensional phase spaces. It is engineered with a strict focus on zero-copy vectorization, robust signal preprocessing, and WebGL-accelerated interactive visualizations to support real-time clinical decision-making and neurophysiological research.
 
