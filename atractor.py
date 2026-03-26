@@ -500,7 +500,7 @@ sidebar = html.Div([
             "fontSize": "13px", "fontWeight": "600",
             "color": ACCENT, "letterSpacing": "0.12em",
         }),
-        html.Div("Topological EEG Analysis _ Rosh Guadiana & Lorudes García", style={
+        html.Div("Topological EEG Analysis _ Rosh Guadiana & Lourdes García", style={
             "fontFamily": "'JetBrains Mono', monospace",
             "fontSize": "10px", "color": "#566573", "marginTop": "2px",
         }),
