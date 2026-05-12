@@ -177,13 +177,15 @@ def ingest_file(content_bytes: bytes, filename: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def bandpass(x: np.ndarray, fs: float, lo: float, hi: float) -> np.ndarray:
+    """Zero-phase IIR filtering using mathematically stable Second-Order Sections (SOS)."""
     nyq = fs / 2.0
     lo_n, hi_n = max(lo / nyq, 1e-4), min(hi / nyq, 0.999)
     if lo_n >= hi_n:
         return np.zeros_like(x)
-    b, a = sp_signal.butter(4, [lo_n, hi_n], btype="band")
-    return sp_signal.filtfilt(b, a, x)
-
+        
+    # SOS cascade design prevents pole-zero cancellation instability
+    sos = sp_signal.butter(4, [lo_n, hi_n], btype="band", output='sos')
+    return sp_signal.sosfiltfilt(sos, x)
 
 def compute_band_powers(x: np.ndarray, fs: float) -> dict:
     """Welch PSD → relative band powers (%)."""
@@ -197,15 +199,85 @@ def compute_band_powers(x: np.ndarray, fs: float) -> dict:
     return powers, freqs, psd
 
 
-def compute_optimal_tau(x: np.ndarray, fs: float, max_lag_sec: float = 0.5) -> int:
-    x_c = x - np.mean(x)
+def compute_optimal_tau(x: np.ndarray, fs: float, max_lag_sec: float = 0.5, bins: int = 64) -> int:
+    """
+    Optimal delay selection via the first minimum of Average Mutual Information (AMI).
+    Captures full non-linear coordinate independence.
+    """
     max_lag = int(max_lag_sec * fs)
-    acf = sp_signal.correlate(x_c, x_c, mode="full", method="fft")
-    acf = acf[len(acf) // 2:][:max_lag]
-    acf /= acf[0] + 1e-12
-    zc = np.where(np.diff(np.sign(acf)))[0]
-    return int(zc[0]) if len(zc) > 0 else max(1, int(fs * 0.05))
+    if len(x) <= max_lag: return max(1, int(fs * 0.05))
+    
+    ami = np.zeros(max_lag)
+    for tau in range(1, max_lag + 1):
+        x_t = x[:-tau]
+        x_tau = x[tau:]
+        
+        # 2D Joint Probability Distribution
+        hist_2d, _, _ = np.histogram2d(x_t, x_tau, bins=bins)
+        p_xy = hist_2d / np.sum(hist_2d)
+        
+        # Marginal Probabilities
+        p_x = np.sum(p_xy, axis=1)
+        p_y = np.sum(p_xy, axis=0)
+        
+        # Compute Shannon Mutual Information
+        p_x_p_y = np.outer(p_x, p_y)
+        nz = p_xy > 0
+        ami[tau-1] = np.sum(p_xy[nz] * np.log2(p_xy[nz] / p_x_p_y[nz]))
+        
+        # First local minimum detection
+        if tau > 2 and ami[tau-2] < ami[tau-3] and ami[tau-2] < ami[tau-1]:
+            return tau - 1
+            
+    return int(np.argmin(ami) + 1)
 
+def compute_optimal_dimension(x: np.ndarray, tau: int, max_m: int = 5) -> int:
+    """Fast False Nearest Neighbors (FNN) heuristic for optimal m."""
+    from scipy.spatial import cKDTree
+    
+    N = len(x)
+    if N < 500: return 3
+    
+    R_tol = 15.0
+    A_tol = 2.0
+    R_A = np.std(x) + 1e-12
+    fnn_ratios = []
+    
+    for m in range(2, max_m + 1):
+        try:
+            E = phase_space(x, tau, dim=m)
+            tree = cKDTree(E)
+            distances, indices = tree.query(E, k=2) # k=2 avoids self-match
+            
+            valid_idx = np.where(distances[:, 1] > 1e-12)[0]
+            if len(valid_idx) == 0:
+                fnn_ratios.append(0)
+                continue
+                
+            false_count = 0
+            for i in valid_idx:
+                nn_i = indices[i, 1]
+                idx1 = i + m * tau
+                idx2 = nn_i + m * tau
+                
+                if idx1 < N and idx2 < N:
+                    d_m1 = abs(x[idx1] - x[idx2])
+                    R_m = distances[i, 1]
+                    
+                    # FNN Criteria check
+                    if (d_m1 / R_m) > R_tol or np.sqrt(R_m**2 + d_m1**2) / R_A > A_tol:
+                        false_count += 1
+                        
+            fnn_ratios.append(false_count / len(valid_idx))
+        except Exception:
+            fnn_ratios.append(1.0)
+            
+    # Find smallest m where FNN drops below 5%
+    for i, m in enumerate(range(2, max_m + 1)):
+        if fnn_ratios[i] < 0.05:
+            return max(3, min(m, 5))
+            
+    return 3 # Fallback
 
 def phase_space(x: np.ndarray, tau: int, dim: int = 3) -> np.ndarray:
     N = len(x)
@@ -234,22 +306,37 @@ def signal_quality(x: np.ndarray, fs: float) -> dict:
     }
 
 
-def _hurst_exponent(x: np.ndarray, max_lag: int = 100) -> float:
-    """Simplified R/S Hurst exponent."""
-    lags = range(2, min(max_lag, len(x) // 4))
-    rs_list = []
-    for lag in lags:
-        s = x[:lag]
-        r = np.ptp(np.cumsum(s - np.mean(s)))
-        sd = np.std(s) + 1e-12
-        rs_list.append(r / sd)
-    if len(rs_list) < 2:
-        return 0.5
-    log_lags = np.log(list(lags))
-    log_rs   = np.log(rs_list)
-    poly     = np.polyfit(log_lags, log_rs, 1)
-    return float(np.clip(poly[0], 0, 1))
-
+def _hurst_exponent(x: np.ndarray) -> float:
+    """Detrended Fluctuation Analysis (DFA) for robust Hurst estimation."""
+    N = len(x)
+    if N < 100: return 0.5
+    
+    # 1. Integrate the mean-centered signal
+    y = np.cumsum(x - np.mean(x))
+    
+    # 2. Define logarithmic window scales
+    scales = np.logspace(1.2, np.log10(N/4), 15).astype(int)
+    scales = np.unique(scales)
+    
+    F = []
+    for n in scales:
+        # Reshape into non-overlapping windows
+        n_windows = N // n
+        windows = y[:n_windows * n].reshape(n_windows, n)
+        
+        # 3. Fit local linear trend (DFA-1) and compute RMS fluctuation
+        x_axis = np.arange(n)
+        coefs = np.polyfit(x_axis, windows.T, 1)
+        trends = np.array([np.polyval(c, x_axis) for c in coefs.T])
+        
+        rms = np.sqrt(np.mean((windows - trends)**2))
+        F.append(rms)
+        
+    # 4. Extract scaling exponent alpha
+    poly = np.polyfit(np.log(scales), np.log(F), 1)
+    
+    # Alpha can theoretically reach ~1.5 for highly non-stationary signals
+    return float(np.clip(poly[0], 0.0, 1.5))
 
 def spectral_energy_gradient(x: np.ndarray, fs: float, n_points: int) -> np.ndarray:
     """Fast short-time spectral energy via STFT (replaces heavy CWT for speed)."""
@@ -273,7 +360,34 @@ def spectral_energy_gradient(x: np.ndarray, fs: float, n_points: int) -> np.ndar
     mn, mx = energy.min(), energy.max()
     energy = (energy - mn) / (mx - mn + 1e-12)
     return energy[:n_points]
-
+def correlation_dimension(E: np.ndarray, r_min: float = 1e-3, r_max: float = 1.0, n_r: int = 20) -> float:
+    """Grassberger-Procaccia algorithm for Correlation Dimension (D2)."""
+    from scipy.spatial import cKDTree
+    
+    N = len(E)
+    if N < 100: return 0.0
+    
+    # Normalize attractor space
+    E_norm = (E - np.min(E, axis=0)) / (np.max(E, axis=0) - np.min(E, axis=0) + 1e-12)
+    tree = cKDTree(E_norm)
+    
+    scales = np.logspace(np.log10(r_min), np.log10(r_max), n_r)
+    C_r = np.zeros(n_r)
+    
+    for i, r in enumerate(scales):
+        # Query hypersphere intersections (O(N log N))
+        pairs = tree.query_pairs(r)
+        C_r[i] = len(pairs) / (N * (N - 1) / 2.0)
+        
+    valid = C_r > 0
+    if np.sum(valid) < 3: return 0.0
+    
+    log_r = np.log(scales[valid])
+    log_C = np.log(C_r[valid])
+    
+    # Extract D2 from the scaling region gradient
+    poly = np.polyfit(log_r, log_C, 1)
+    return float(poly[0])
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. FIGURE BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -422,63 +536,45 @@ EXTRA_CSS = f"""
   --sans:    'Space Grotesk', sans-serif;
 }}
 body, .container-fluid {{ background: var(--bg) !important; color: var(--text); }}
-.card {{ background: var(--card) !important; border: 1px solid var(--border) !important;
-         border-radius: 10px !important; }}
-.card-header {{ background: rgba(255,255,255,0.03) !important;
-                border-bottom: 1px solid var(--border) !important;
-                font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
-                color: var(--accent) !important; text-transform: uppercase; }}
-.metric-card {{ background: var(--card); border: 1px solid var(--border);
-                border-radius: 8px; padding: 14px 18px; }}
-.metric-label {{ font-family: var(--mono); font-size: 10px; color: var(--muted);
-                 letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 4px; }}
-.metric-value {{ font-family: var(--mono); font-size: 18px; color: var(--accent);
-                 font-weight: 600; }}
-.insight-row {{ display: flex; justify-content: space-between; padding: 6px 0;
-                border-bottom: 1px solid var(--border); font-family: var(--mono);
-                font-size: 11px; }}
+.card {{ background: var(--card) !important; border: 1px solid var(--border) !important; border-radius: 10px !important; }}
+.card-header {{ background: rgba(255,255,255,0.03) !important; border-bottom: 1px solid var(--border) !important; font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; color: var(--accent) !important; text-transform: uppercase; }}
+
+/* Metrics & Dropzones */
+.metric-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; }}
+.metric-label {{ font-family: var(--mono); font-size: 10px; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 4px; }}
+.metric-value {{ font-family: var(--mono); font-size: 18px; color: var(--accent); font-weight: 600; }}
+.insight-row {{ display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 11px; }}
 .insight-label {{ color: var(--muted); }}
 .insight-value {{ color: var(--text); font-weight: 600; }}
-.drop-zone {{
-  border: 2px dashed var(--border);
-  border-radius: 12px;
-  background: rgba(0,212,255,0.02);
-  padding: 40px;
-  text-align: center;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  font-family: var(--mono);
-}}
-.drop-zone:hover, .drop-zone.dragover {{
-  border-color: var(--accent);
-  background: rgba(0,212,255,0.06);
-}}
+.drop-zone {{ border: 2px dashed var(--border); border-radius: 12px; background: rgba(0,212,255,0.02); padding: 40px; text-align: center; cursor: pointer; transition: all 0.2s ease; font-family: var(--mono); }}
+.drop-zone:hover, .drop-zone.dragover {{ border-color: var(--accent); background: rgba(0,212,255,0.06); }}
 .drop-icon {{ font-size: 40px; margin-bottom: 12px; opacity: 0.5; }}
 .drop-title {{ color: var(--text); font-size: 14px; margin-bottom: 6px; }}
 .drop-sub {{ color: var(--muted); font-size: 11px; }}
-.badge-fmt {{ background: var(--accent); color: var(--bg); padding: 2px 8px;
-              border-radius: 4px; font-family: var(--mono); font-size: 10px;
-              font-weight: 600; }}
-Select, select {{ background: var(--card) !important; color: var(--text) !important;
-                  border-color: var(--border) !important; font-family: var(--mono) !important;
-                  font-size: 12px !important; }}
-.Select-control {{ background: var(--card) !important; border-color: var(--border) !important; }}
-.Select-menu-outer {{ background: var(--card) !important; border-color: var(--border) !important; }}
-.Select-option {{ background: var(--card) !important; color: var(--text) !important; }}
-.Select-value-label {{ color: var(--text) !important; font-family: var(--mono) !important;
-                        font-size: 12px !important; }}
-.btn-run {{ background: linear-gradient(135deg, var(--accent), #0080ff);
-            border: none; color: var(--bg); font-family: var(--mono);
-            font-size: 12px; font-weight: 700; letter-spacing: 0.05em;
-            padding: 10px 28px; border-radius: 6px; cursor: pointer;
-            transition: opacity 0.2s; width: 100%; margin-top: 12px; }}
-.btn-run:hover {{ opacity: 0.85; }}
+.badge-fmt {{ background: var(--accent); color: var(--bg); padding: 2px 8px; border-radius: 4px; font-family: var(--mono); font-size: 10px; font-weight: 600; }}
+
+/* 1. DASH DROPDOWN OVERRIDES (CHANNEL SELECT) */
+.Select-control {{ background-color: var(--bg) !important; border-color: var(--border) !important; color: var(--text) !important; }}
+.Select-menu-outer {{ background-color: var(--bg) !important; border: 1px solid var(--border) !important; }}
+.Select-option {{ background-color: var(--bg) !important; color: var(--text) !important; }}
+.Select-option:hover, .Select-option.is-focused {{ background-color: var(--border) !important; color: var(--accent) !important; }}
+.has-value.Select--single > .Select-control .Select-value .Select-value-label, 
+.has-value.is-pseudo-focused.Select--single > .Select-control .Select-value .Select-value-label {{ color: var(--text) !important; }}
+.Select-input > input {{ color: var(--text) !important; }}
+
+/* 2. DASH SLIDER OVERRIDES (PARAMETERS & EPOCH) */
 .rc-slider-track {{ background-color: var(--accent) !important; }}
-.rc-slider-handle {{ border-color: var(--accent) !important; background: var(--accent) !important; }}
-#status-bar {{ font-family: var(--mono); font-size: 11px; padding: 8px 14px;
-               border-radius: 6px; margin-top: 10px; }}
+.rc-slider-handle {{ border-color: var(--accent) !important; background: var(--accent) !important; box-shadow: none !important; }}
+.rc-slider-mark-text {{ color: var(--muted) !important; font-family: var(--mono); }}
+.rc-slider-mark-text-active {{ color: var(--text) !important; }}
+.rc-slider-tooltip-inner {{ background-color: var(--card) !important; color: var(--accent) !important; border: 1px solid var(--border) !important; box-shadow: none !important; font-family: var(--mono); }}
+.rc-slider-tooltip-arrow {{ border-top-color: var(--border) !important; border-bottom-color: var(--border) !important; }}
+
+/* Buttons & Status */
+.btn-run {{ background: linear-gradient(135deg, var(--accent), #0080ff); border: none; color: var(--bg); font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: 0.05em; padding: 10px 28px; border-radius: 6px; cursor: pointer; transition: opacity 0.2s; width: 100%; margin-top: 12px; }}
+.btn-run:hover {{ opacity: 0.85; }}
+#status-bar {{ font-family: var(--mono); font-size: 11px; padding: 8px 14px; border-radius: 6px; margin-top: 10px; }}
 """
-import pathlib
 pathlib.Path("assets").mkdir(exist_ok=True)
 with open("assets/custom.css", "w") as _f:
     _f.write(EXTRA_CSS)
@@ -552,9 +648,17 @@ sidebar = html.Div([
         ])
     ], style={"marginBottom": "12px"}),
 
-    # Parameters
+# Parameters
     dbc.Card([
-        dbc.CardHeader("04 · Parameters"),
+        dbc.CardHeader([
+            html.Div("04 · Parameters", style={"display": "inline-block"}),
+            html.Button("AUTO", id="btn-auto", n_clicks=0, style={
+                "float": "right", "background": "var(--accent)", "color": "var(--bg)",
+                "border": "none", "borderRadius": "4px", "fontSize": "9px",
+                "fontWeight": "bold", "padding": "2px 6px", "cursor": "pointer",
+                "fontFamily": "var(--mono)", "letterSpacing": "0.1em"
+            })
+        ]),
         dbc.CardBody([
             html.Div("Embedding Dimension", style={
                 "fontFamily": "'JetBrains Mono',monospace",
@@ -572,9 +676,13 @@ sidebar = html.Div([
             }),
             dcc.Slider(id="tau-slider", min=10, max=500, step=10, value=150,
                        tooltip={"placement": "bottom", "always_visible": True}),
+            html.Div(id="auto-status", style={
+                "fontFamily": "'JetBrains Mono',monospace", 
+                "fontSize": "10px", "color": "var(--accent)", 
+                "marginTop": "12px", "textAlign": "center"
+            })
         ])
     ], style={"marginBottom": "12px"}),
-
     # Run button
     html.Button("▶  RUN ANALYSIS", id="run-btn", n_clicks=0,
                 className="btn-run"),
@@ -889,8 +997,11 @@ def run_analysis(n_clicks, ch_data, fs, channel, epoch, dim, max_tau_ms):
         if theta_pct > 25: state_hints.append("↑ Theta  →  drowsiness / memory encoding")
         if kurtosis > 10:  state_hints.append("High kurtosis  →  possible spike artifacts")
         if not state_hints: state_hints = ["Normal waking spectrum pattern"]
+        
+        d2_dim = correlation_dimension(E)
 
         dynamics_panel = html.Div([
+            insight_row("Correlation Dim (D₂)", f"{d2_dim:.3f}"),
             insight_row("Hurst Exponent", f"{hurst_val:.3f}"),
             html.Div([
                 html.Span(h_text, style={"fontFamily": "'JetBrains Mono',monospace",
