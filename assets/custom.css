@@ -28,14 +28,15 @@ body, .container-fluid { background: var(--bg) !important; color: var(--text); }
 .badge-fmt { background: var(--accent); color: var(--bg); padding: 2px 8px; border-radius: 4px; font-family: var(--mono); font-size: 10px; font-weight: 600; }
 
 /* 1. DASH DROPDOWN OVERRIDES (CHANNEL SELECT) */
-.Select-control { background-color: var(--bg) !important; border-color: var(--border) !important; color: var(--text) !important; }
-.Select-menu-outer { background-color: var(--bg) !important; border: 1px solid var(--border) !important; }
-.Select-option { background-color: var(--bg) !important; color: var(--text) !important; }
-.Select-option:hover, .Select-option.is-focused { background-color: var(--border) !important; color: var(--accent) !important; }
+.Select-control {background-color: var(--bg) !important; border-color: var(--border) !important; }
+.Select-menu-outer {background-color: var(--bg) !important; border: 1px solid var(--border) !important; }
+.Select-option {background-color: var(--bg) !important; color: var(--text) !important;}
+.Select-option:hover, .Select-option.is-focused {background-color: var(--border) !important; color: var(--accent) !important; }
+/* Force blue letters for the selected channel */
 .has-value.Select--single > .Select-control .Select-value .Select-value-label, 
-.has-value.is-pseudo-focused.Select--single > .Select-control .Select-value .Select-value-label { color: var(--text) !important; }
-.Select-input > input { color: var(--text) !important; }
-
+.has-value.is-pseudo-focused.Select--single > .Select-control .Select-value .Select-value-label {color: var(--accent) !important; font-weight: 600; }
+.Select-input > input { color: var(--accent) !important; }
+.Select-placeholder {color: var(--muted) !important; }
 /* 2. DASH SLIDER OVERRIDES (PARAMETERS & EPOCH) */
 .rc-slider-track { background-color: var(--accent) !important; }
 .rc-slider-handle { border-color: var(--accent) !important; background: var(--accent) !important; box-shadow: none !important; }
@@ -43,6 +44,16 @@ body, .container-fluid { background: var(--bg) !important; color: var(--text); }
 .rc-slider-mark-text-active { color: var(--text) !important; }
 .rc-slider-tooltip-inner { background-color: var(--card) !important; color: var(--accent) !important; border: 1px solid var(--border) !important; box-shadow: none !important; font-family: var(--mono); }
 .rc-slider-tooltip-arrow { border-top-color: var(--border) !important; border-bottom-color: var(--border) !important; }
+
+/* Add this inside the EXTRA_CSS string, at the bottom */
+.num-input { 
+    background: var(--bg); border: 1px solid var(--border); 
+    color: var(--accent); font-family: var(--mono); 
+    font-size: 11px; width: 100%; border-radius: 4px; 
+    padding: 2px 6px; text-align: center; outline: none; 
+    transition: border-color 0.2s;
+}
+.num-input:focus { border-color: var(--accent); }
 
 /* Buttons & Status */
 .btn-run { background: linear-gradient(135deg, var(--accent), #0080ff); border: none; color: var(--bg); font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: 0.05em; padding: 10px 28px; border-radius: 6px; cursor: pointer; transition: opacity 0.2s; width: 100%; margin-top: 12px; }

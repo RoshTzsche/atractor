@@ -85,7 +85,7 @@ def ingest_file(content_bytes: bytes, filename: str):
                 tmp_path = tmp.name
             raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
             fs = raw.info["sfreq"]
-            channels = {ch: raw.get_data(picks=[ch])[0] for ch in raw.ch_names[:32]}
+            channels = {ch: raw.get_data(picks=[ch])[0] * 1e6 for ch in raw.ch_names[:32]}            
             os.unlink(tmp_path)
             return channels, fs, ext.upper()
         except ImportError:
@@ -188,22 +188,26 @@ def bandpass(x: np.ndarray, fs: float, lo: float, hi: float) -> np.ndarray:
     return sp_signal.sosfiltfilt(sos, x)
 
 def compute_band_powers(x: np.ndarray, fs: float) -> dict:
-    """Welch PSD → relative band powers (%)."""
+    """Welch PSD → relative band powers (%). Normalized to canonical EEG bands."""
     nperseg = min(len(x), int(fs * 4))
     freqs, psd = sp_signal.welch(x, fs=fs, nperseg=nperseg)
-    total = np.trapz(psd, freqs) + 1e-12
-    powers = {}
+    
+    # Calculate absolute power per band
+    powers_abs = {}
     for name, (lo, hi, _) in EEG_BANDS.items():
         mask = (freqs >= lo) & (freqs <= hi)
-        powers[name] = float(np.trapz(psd[mask], freqs[mask]) / total * 100)
+        powers_abs[name] = float(np.trapz(psd[mask], freqs[mask]))
+        
+    # Normalize strictly against the sum of the 5 canonical bands, avoiding empty Nyquist space
+    total_canonical = sum(powers_abs.values()) + 1e-12
+    powers = {k: (v / total_canonical) * 100 for k, v in powers_abs.items()}
     return powers, freqs, psd
 
-
-def compute_optimal_tau(x: np.ndarray, fs: float, max_lag_sec: float = 0.5, bins: int = 64) -> int:
-    """
-    Optimal delay selection via the first minimum of Average Mutual Information (AMI).
-    Captures full non-linear coordinate independence.
-    """
+def compute_optimal_tau(x: np.ndarray, fs: float, max_lag_sec: float = 1.0, bins: int = 32) -> int:
+    """AMI optimal delay. Optimized with stationary subsampling."""
+    # PERFORMANCE CAP: Use representative sample for probability distribution
+    if len(x) > 1000: x = x[:1000] 
+    
     max_lag = int(max_lag_sec * fs)
     if len(x) <= max_lag: return max(1, int(fs * 0.05))
     
@@ -211,35 +215,27 @@ def compute_optimal_tau(x: np.ndarray, fs: float, max_lag_sec: float = 0.5, bins
     for tau in range(1, max_lag + 1):
         x_t = x[:-tau]
         x_tau = x[tau:]
-        
-        # 2D Joint Probability Distribution
         hist_2d, _, _ = np.histogram2d(x_t, x_tau, bins=bins)
         p_xy = hist_2d / np.sum(hist_2d)
-        
-        # Marginal Probabilities
         p_x = np.sum(p_xy, axis=1)
         p_y = np.sum(p_xy, axis=0)
-        
-        # Compute Shannon Mutual Information
         p_x_p_y = np.outer(p_x, p_y)
         nz = p_xy > 0
         ami[tau-1] = np.sum(p_xy[nz] * np.log2(p_xy[nz] / p_x_p_y[nz]))
-        
-        # First local minimum detection
         if tau > 2 and ami[tau-2] < ami[tau-3] and ami[tau-2] < ami[tau-1]:
             return tau - 1
-            
     return int(np.argmin(ami) + 1)
 
 def compute_optimal_dimension(x: np.ndarray, tau: int, max_m: int = 5) -> int:
-    """Fast False Nearest Neighbors (FNN) heuristic for optimal m."""
+    """FNN heuristic. Optimized with stationary subsampling."""
     from scipy.spatial import cKDTree
+    # PERFORMANCE CAP
+    if len(x) > 1000: x = x[:1000]
     
     N = len(x)
-    if N < 500: return 3
+    if N < 100: return 3
     
-    R_tol = 15.0
-    A_tol = 2.0
+    R_tol, A_tol = 15.0, 2.0
     R_A = np.std(x) + 1e-12
     fnn_ratios = []
     
@@ -247,37 +243,26 @@ def compute_optimal_dimension(x: np.ndarray, tau: int, max_m: int = 5) -> int:
         try:
             E = phase_space(x, tau, dim=m)
             tree = cKDTree(E)
-            distances, indices = tree.query(E, k=2) # k=2 avoids self-match
-            
+            distances, indices = tree.query(E, k=2)
             valid_idx = np.where(distances[:, 1] > 1e-12)[0]
             if len(valid_idx) == 0:
                 fnn_ratios.append(0)
                 continue
-                
             false_count = 0
             for i in valid_idx:
                 nn_i = indices[i, 1]
-                idx1 = i + m * tau
-                idx2 = nn_i + m * tau
-                
+                idx1, idx2 = i + m * tau, nn_i + m * tau
                 if idx1 < N and idx2 < N:
-                    d_m1 = abs(x[idx1] - x[idx2])
-                    R_m = distances[i, 1]
-                    
-                    # FNN Criteria check
+                    d_m1, R_m = abs(x[idx1] - x[idx2]), distances[i, 1]
                     if (d_m1 / R_m) > R_tol or np.sqrt(R_m**2 + d_m1**2) / R_A > A_tol:
                         false_count += 1
-                        
             fnn_ratios.append(false_count / len(valid_idx))
         except Exception:
             fnn_ratios.append(1.0)
-            
-    # Find smallest m where FNN drops below 5%
+    
     for i, m in enumerate(range(2, max_m + 1)):
-        if fnn_ratios[i] < 0.05:
-            return max(3, min(m, 5))
-            
-    return 3 # Fallback
+        if fnn_ratios[i] < 0.05: return max(3, min(m, 5))
+    return 3
 
 def phase_space(x: np.ndarray, tau: int, dim: int = 3) -> np.ndarray:
     N = len(x)
@@ -360,33 +345,29 @@ def spectral_energy_gradient(x: np.ndarray, fs: float, n_points: int) -> np.ndar
     mn, mx = energy.min(), energy.max()
     energy = (energy - mn) / (mx - mn + 1e-12)
     return energy[:n_points]
+
 def correlation_dimension(E: np.ndarray, r_min: float = 1e-3, r_max: float = 1.0, n_r: int = 20) -> float:
-    """Grassberger-Procaccia algorithm for Correlation Dimension (D2)."""
+    """Grassberger-Procaccia D2. Optimized with randomized subsampling."""
     from scipy.spatial import cKDTree
     
+    # PERFORMANCE CAP: Random spatial sample reduces O(N^2) load
+    if len(E) > 1000:
+        np.random.seed(42)
+        idx = np.random.choice(len(E), 1000, replace=False)
+        E = E[idx]
+        
     N = len(E)
     if N < 100: return 0.0
-    
-    # Normalize attractor space
     E_norm = (E - np.min(E, axis=0)) / (np.max(E, axis=0) - np.min(E, axis=0) + 1e-12)
     tree = cKDTree(E_norm)
-    
     scales = np.logspace(np.log10(r_min), np.log10(r_max), n_r)
     C_r = np.zeros(n_r)
-    
     for i, r in enumerate(scales):
-        # Query hypersphere intersections (O(N log N))
         pairs = tree.query_pairs(r)
         C_r[i] = len(pairs) / (N * (N - 1) / 2.0)
-        
     valid = C_r > 0
     if np.sum(valid) < 3: return 0.0
-    
-    log_r = np.log(scales[valid])
-    log_C = np.log(C_r[valid])
-    
-    # Extract D2 from the scaling region gradient
-    poly = np.polyfit(log_r, log_C, 1)
+    poly = np.polyfit(np.log(scales[valid]), np.log(C_r[valid]), 1)
     return float(poly[0])
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. FIGURE BUILDERS
@@ -524,6 +505,7 @@ app = dash.Dash(
 app.title = "Takens Attractor · EEG Dashboard"
 
 # ── CSS overrides ─────────────────────────────────────────────────────────────
+# ── CSS overrides ─────────────────────────────────────────────────────────────
 EXTRA_CSS = f"""
 :root {{
   --bg:      {DARK_BG};
@@ -554,14 +536,15 @@ body, .container-fluid {{ background: var(--bg) !important; color: var(--text); 
 .badge-fmt {{ background: var(--accent); color: var(--bg); padding: 2px 8px; border-radius: 4px; font-family: var(--mono); font-size: 10px; font-weight: 600; }}
 
 /* 1. DASH DROPDOWN OVERRIDES (CHANNEL SELECT) */
-.Select-control {{ background-color: var(--bg) !important; border-color: var(--border) !important; color: var(--text) !important; }}
-.Select-menu-outer {{ background-color: var(--bg) !important; border: 1px solid var(--border) !important; }}
-.Select-option {{ background-color: var(--bg) !important; color: var(--text) !important; }}
-.Select-option:hover, .Select-option.is-focused {{ background-color: var(--border) !important; color: var(--accent) !important; }}
+.Select-control {{background-color: var(--bg) !important; border-color: var(--border) !important; }}
+.Select-menu-outer {{background-color: var(--bg) !important; border: 1px solid var(--border) !important; }}
+.Select-option {{background-color: var(--bg) !important; color: var(--text) !important;}}
+.Select-option:hover, .Select-option.is-focused {{background-color: var(--border) !important; color: var(--accent) !important; }}
+/* Force blue letters for the selected channel */
 .has-value.Select--single > .Select-control .Select-value .Select-value-label, 
-.has-value.is-pseudo-focused.Select--single > .Select-control .Select-value .Select-value-label {{ color: var(--text) !important; }}
-.Select-input > input {{ color: var(--text) !important; }}
-
+.has-value.is-pseudo-focused.Select--single > .Select-control .Select-value .Select-value-label {{color: var(--accent) !important; font-weight: 600; }}
+.Select-input > input {{ color: var(--accent) !important; }}
+.Select-placeholder {{color: var(--muted) !important; }}
 /* 2. DASH SLIDER OVERRIDES (PARAMETERS & EPOCH) */
 .rc-slider-track {{ background-color: var(--accent) !important; }}
 .rc-slider-handle {{ border-color: var(--accent) !important; background: var(--accent) !important; box-shadow: none !important; }}
@@ -569,6 +552,16 @@ body, .container-fluid {{ background: var(--bg) !important; color: var(--text); 
 .rc-slider-mark-text-active {{ color: var(--text) !important; }}
 .rc-slider-tooltip-inner {{ background-color: var(--card) !important; color: var(--accent) !important; border: 1px solid var(--border) !important; box-shadow: none !important; font-family: var(--mono); }}
 .rc-slider-tooltip-arrow {{ border-top-color: var(--border) !important; border-bottom-color: var(--border) !important; }}
+
+/* Add this inside the EXTRA_CSS string, at the bottom */
+.num-input {{ 
+    background: var(--bg); border: 1px solid var(--border); 
+    color: var(--accent); font-family: var(--mono); 
+    font-size: 11px; width: 100%; border-radius: 4px; 
+    padding: 2px 6px; text-align: center; outline: none; 
+    transition: border-color 0.2s;
+}}
+.num-input:focus {{ border-color: var(--accent); }}
 
 /* Buttons & Status */
 .btn-run {{ background: linear-gradient(135deg, var(--accent), #0080ff); border: none; color: var(--bg); font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: 0.05em; padding: 10px 28px; border-radius: 6px; cursor: pointer; transition: opacity 0.2s; width: 100%; margin-top: 12px; }}
@@ -596,7 +589,7 @@ sidebar = html.Div([
             "fontSize": "13px", "fontWeight": "600",
             "color": ACCENT, "letterSpacing": "0.12em",
         }),
-        html.Div("Topological EEG Analysis _ Rosh Guadiana & Lourdes García", style={
+        html.Div("Topological EEG Analysis _ Rosh Guadiana & Lourdes García _ Git: RoshTzsche", style={
             "fontFamily": "'JetBrains Mono', monospace",
             "fontSize": "10px", "color": "#566573", "marginTop": "2px",
         }),
@@ -635,19 +628,31 @@ sidebar = html.Div([
         ])
     ], style={"marginBottom": "12px"}),
 
-    # Epoch
+# Epoch
     dbc.Card([
         dbc.CardHeader("03 · Epoch Window (seconds)"),
         dbc.CardBody([
+            dbc.Row([
+                dbc.Col(html.Div("Start", style={
+                    "fontFamily": "'JetBrains Mono',monospace", "fontSize": "10px", 
+                    "color": "#566573", "textTransform": "uppercase"
+                }), width=3),
+                dbc.Col(dcc.Input(id="epoch-start-input", type="number", min=0, max=60, step=0.5, value=0, className="num-input"), width=3),
+                dbc.Col(html.Div("End", style={
+                    "fontFamily": "'JetBrains Mono',monospace", "fontSize": "10px", 
+                    "color": "#566573", "textTransform": "uppercase", "textAlign": "right"
+                }), width=3),
+                dbc.Col(dcc.Input(id="epoch-end-input", type="number", min=0, max=60, step=0.5, value=15, className="num-input"), width=3)
+            ], align="center", style={"marginBottom": "12px"}),
+            
             dcc.RangeSlider(id="epoch-slider", min=0, max=60, step=0.5,
                             value=[0, 15], allowCross=False,
-                            tooltip={"placement": "bottom", "always_visible": True},
+                            tooltip={"placement": "bottom", "always_visible": False},
                             marks={i: {"label": str(i),
                                        "style": {"fontSize": "10px", "color": "#566573"}}
                                    for i in range(0, 61, 10)}),
         ])
     ], style={"marginBottom": "12px"}),
-
 # Parameters
     dbc.Card([
         dbc.CardHeader([
@@ -656,33 +661,51 @@ sidebar = html.Div([
                 "float": "right", "background": "var(--accent)", "color": "var(--bg)",
                 "border": "none", "borderRadius": "4px", "fontSize": "9px",
                 "fontWeight": "bold", "padding": "2px 6px", "cursor": "pointer",
-                "fontFamily": "var(--mono)", "letterSpacing": "0.1em"
+                "fontFamily": "var(--mono)", "letterSpacing": "0.1em",
+                "transition": "all 0.3s ease"
             })
         ]),
-        dbc.CardBody([
-            html.Div("Embedding Dimension", style={
-                "fontFamily": "'JetBrains Mono',monospace",
-                "fontSize": "10px", "color": "#566573",
-                "textTransform": "uppercase", "marginBottom": "4px",
-            }),
-            dcc.Slider(id="dim-slider", min=3, max=5, step=1, value=3,
-                       marks={3: "3", 4: "4", 5: "5 (slow)"},
-                       tooltip={"always_visible": False}),
-            html.Div("Max Tau Search (ms)", style={
-                "fontFamily": "'JetBrains Mono',monospace",
-                "fontSize": "10px", "color": "#566573",
-                "textTransform": "uppercase",
-                "marginTop": "14px", "marginBottom": "4px",
-            }),
-            dcc.Slider(id="tau-slider", min=10, max=500, step=10, value=150,
-                       tooltip={"placement": "bottom", "always_visible": True}),
-            html.Div(id="auto-status", style={
-                "fontFamily": "'JetBrains Mono',monospace", 
-                "fontSize": "10px", "color": "var(--accent)", 
-                "marginTop": "12px", "textAlign": "center"
-            })
-        ])
+        dcc.Loading(
+            id="loading-auto",
+            type="circle", 
+            color=ACCENT,
+            children=dbc.CardBody([
+                
+                # Embedding Dimension Row
+                dbc.Row([
+                    dbc.Col(html.Div("Embedding Dim (m)", style={
+                        "fontFamily": "'JetBrains Mono',monospace", "fontSize": "10px", 
+                        "color": "#566573", "textTransform": "uppercase"
+                    }), width=8),
+                    dbc.Col(dcc.Input(id="dim-input", type="number", min=3, max=5, step=1, value=3, className="num-input"), width=4)
+                ], align="center", style={"marginBottom": "6px"}),
+                
+                dcc.Slider(id="dim-slider", min=3, max=5, step=1, value=3,
+                           marks={3: "3", 4: "4", 5: "5 (slow)"},
+                           tooltip={"always_visible": False}),
+                
+                # Tau Search Row
+                dbc.Row([
+                    dbc.Col(html.Div("Max Tau Search (ms)", style={
+                        "fontFamily": "'JetBrains Mono',monospace", "fontSize": "10px", 
+                        "color": "#566573", "textTransform": "uppercase"
+                    }), width=8),
+                    dbc.Col(dcc.Input(id="tau-input", type="number", min=10, max=1000, step=10, value=150, className="num-input"), width=4)
+                ], align="center", style={"marginTop": "14px", "marginBottom": "6px"}),
+                
+                dcc.Slider(id="tau-slider", min=10, max=500, step=10, value=150,
+                           tooltip={"placement": "bottom", "always_visible": False}),
+                
+                html.Div(id="auto-status", style={
+                    "fontFamily": "'JetBrains Mono',monospace", 
+                    "fontSize": "10px", "color": "var(--accent)", 
+                    "marginTop": "12px", "textAlign": "center",
+                    "minHeight": "14px"
+                })
+            ])
+        )
     ], style={"marginBottom": "12px"}),
+
     # Run button
     html.Button("▶  RUN ANALYSIS", id="run-btn", n_clicks=0,
                 className="btn-run"),
@@ -783,14 +806,17 @@ main_area = html.Div([
 
 app.layout = html.Div([
     # Hidden stores
-    dcc.Store(id="store-channels"),   # {name: list_of_floats}
-    dcc.Store(id="store-fs"),         # float
-    dcc.Store(id="store-fmt"),        # str
+    dcc.Store(id="store-channels"),   
+    dcc.Store(id="store-fs"),         
+    dcc.Store(id="store-fmt"),        
+    dcc.Store(id="store-optimal", data={"m": None, "tau": None}), # NEW: State Machine Cache
     # Layout
     html.Div([sidebar, main_area],
              style={"display": "flex", "height": "100vh", "overflow": "hidden"}),
 ], style={"background": DARK_BG})
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. CALLBACKS
+# ─────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. CALLBACKS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -803,6 +829,10 @@ app.layout = html.Div([
     Output("channel-select", "value"),
     Output("epoch-slider",   "max"),
     Output("epoch-slider",   "value"),
+    Output("epoch-start-input", "max"),
+    Output("epoch-end-input", "max"),
+    Output("epoch-start-input", "value"),
+    Output("epoch-end-input", "value"),
     Output("file-info",      "children"),
     Input("upload-data", "contents"),
     State("upload-data", "filename"),
@@ -848,8 +878,7 @@ def on_upload(contents, filename):
         }),
     ], style={"marginTop": "8px"})
 
-    return ch_data, fs, fmt, ch_options, first_ch, max_dur, [0, default_end], info
-
+    return ch_data, fs, fmt, ch_options, first_ch, max_dur, [0, default_end], max_dur, max_dur, 0, default_end, info
 
 @app.callback(
     # Figures
@@ -993,7 +1022,7 @@ def run_analysis(n_clicks, ch_data, fs, channel, epoch, dim, max_tau_ms):
 
         state_hints = []
         if alpha_pct > 30: state_hints.append("↑ Alpha  →  relaxed / eyes-closed")
-        if delta_pct > 40: state_hints.append("↑ Delta  →  deep sleep / pathology")
+        if delta_pct > 60: state_hints.append("↑ Delta  →  deep sleep / pathology")
         if theta_pct > 25: state_hints.append("↑ Theta  →  drowsiness / memory encoding")
         if kurtosis > 10:  state_hints.append("High kurtosis  →  possible spike artifacts")
         if not state_hints: state_hints = ["Normal waking spectrum pattern"]
@@ -1050,6 +1079,139 @@ def run_analysis(n_clicks, ch_data, fs, channel, epoch, dim, max_tau_ms):
         tb = traceback.format_exc()
         print(tb)
         return fail(str(e))
+
+# Sync Dimension Slider and Input
+@app.callback(
+    Output("dim-slider", "value"),
+    Output("dim-input", "value"),
+    Input("dim-slider", "value"),
+    Input("dim-input", "value"),
+    prevent_initial_call=True
+)
+def sync_dim(slider_val, input_val):
+    trigger = dash.callback_context.triggered[0]["prop_id"].split(".")[0]
+    val = slider_val if trigger == "dim-slider" else input_val
+    return val, val
+
+# Sync Tau Slider and Input
+@app.callback(
+    Output("tau-slider", "value"),
+    Output("tau-input", "value"),
+    Input("tau-slider", "value"),
+    Input("tau-input", "value"),
+    prevent_initial_call=True
+)
+def sync_tau(slider_val, input_val):
+    trigger = dash.callback_context.triggered[0]["prop_id"].split(".")[0]
+    val = slider_val if trigger == "tau-slider" else input_val
+    return val, val
+
+# Sync Epoch Slider and Inputs
+@app.callback(
+    Output("epoch-slider", "value"),
+    Output("epoch-start-input", "value"),
+    Output("epoch-end-input", "value"),
+    Input("epoch-slider", "value"),
+    Input("epoch-start-input", "value"),
+    Input("epoch-end-input", "value"),
+    State("epoch-slider", "max"),
+    prevent_initial_call=True
+)
+def sync_epoch(slider_val, start_val, end_val, max_val):
+    trigger = dash.callback_context.triggered[0]["prop_id"].split(".")[0]
+    
+    if trigger == "epoch-slider":
+        # Slider was moved, update the inputs
+        return slider_val, slider_val[0], slider_val[1]
+        
+    # An input box was typed into, update the slider and validate constraints
+    start = start_val if start_val is not None else 0
+    end = end_val if end_val is not None else 15
+    
+    # Boundary logic
+    if max_val is None: max_val = 60
+    if start < 0: start = 0
+    if end > max_val: end = max_val
+    if start >= end: start = max(0, end - 0.5)
+    
+    return [start, end], start, end
+
+# UPDATE auto_tune_parameters TO OUTPUT TO ALL 4 CONTROLS
+@app.callback(
+    Output("dim-slider", "value", allow_duplicate=True),
+    Output("dim-input", "value", allow_duplicate=True),
+    Output("tau-slider", "value", allow_duplicate=True),
+    Output("tau-input", "value", allow_duplicate=True),
+    Output("auto-status", "children"),
+    Output("store-optimal", "data"),
+    Input("btn-auto", "n_clicks"),
+    State("store-channels", "data"),
+    State("store-fs", "data"),
+    State("channel-select", "value"),
+    State("epoch-slider", "value"),
+    prevent_initial_call=True,
+)
+def auto_tune_parameters(n_clicks, ch_data, fs, channel, epoch):
+    if not ch_data or not channel or channel not in ch_data:
+        return [dash.no_update]*4 + ["⚠ Load data first", dash.no_update]
+    try:
+        x = np.array(ch_data[channel], dtype=np.float64)
+        fs = float(fs)
+        t0, t1 = float(epoch[0]), float(epoch[1])
+        i0, i1 = int(t0 * fs), min(int(t1 * fs), len(x))
+        x_ep = x[i0:i1]
+        x_ep = sp_signal.detrend(x_ep)
+        x_ep = bandpass(x_ep, fs, 0.5, min(45.0, fs/2.0 - 1))
+        
+        f_target = 100.0  
+        q_factor = max(1, int(fs / f_target))
+        fs_new = fs / q_factor if q_factor > 1 else fs
+        x_dec = sp_signal.decimate(x_ep, q_factor, ftype='iir', zero_phase=True) if q_factor > 1 else x_ep
+            
+        tau_smp = compute_optimal_tau(x_dec, fs_new, max_lag_sec=1.0)
+        tau_ms = (tau_smp / fs_new) * 1000.0
+        optimal_tau = min(500, max(10, int(np.ceil(tau_ms / 10.0)) * 10))
+        optimal_dim = compute_optimal_dimension(x_dec, tau_smp, max_m=5)
+        
+        status_msg = f"✓ Tuned: m={optimal_dim}, max_τ={optimal_tau}ms"
+        optimal_cache = {"m": optimal_dim, "tau": optimal_tau}
+        
+        return optimal_dim, optimal_dim, optimal_tau, optimal_tau, status_msg, optimal_cache
+    except Exception as e:
+        return [dash.no_update]*4 + [f"⚠ Error: {str(e)}", dash.no_update]
+
+@app.callback(
+    Output("btn-auto", "style"),
+    Input("dim-slider", "value"),
+    Input("tau-slider", "value"),
+    Input("store-optimal", "data"),
+    prevent_initial_call=True,
+)
+def verify_parameter_state(current_dim, current_tau, optimal_data):
+    """
+    Reactive observer: Checks if manual sliders match the calculated optimal cache.
+    Reconstructs the full style dict to prevent Dash from dropping CSS properties.
+    """
+    # 1. Base CSS that must ALWAYS be applied to the button
+    base_style = {
+        "float": "right", "border": "none", "borderRadius": "4px", 
+        "fontSize": "9px", "fontWeight": "bold", "padding": "2px 6px", 
+        "cursor": "pointer", "fontFamily": "var(--mono)", 
+        "letterSpacing": "0.1em", "transition": "background-color 0.4s ease"
+    }
+    
+    # 2. Check if we have mathematically verified coordinates
+    if optimal_data and optimal_data.get("m") is not None:
+        if current_dim == optimal_data["m"] and current_tau == optimal_data["tau"]:
+            # VERIFIED STATE (Green)
+            base_style["background"] = "#06d6a0" 
+            base_style["color"] = "#0a0c10"
+            return base_style
+            
+    # 3. DEFAULT / UNVERIFIED STATE (Cyan)
+    base_style["background"] = "var(--accent)"
+    base_style["color"] = "var(--bg)"
+    return base_style
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. ENTRY POINT
